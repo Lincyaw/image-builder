@@ -1,0 +1,1 @@
+HF_ENDPOINT=https://hf-mirror.com uv run python -m r2e_docker.batch build_from_dataset

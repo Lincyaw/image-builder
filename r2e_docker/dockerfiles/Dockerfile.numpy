@@ -1,0 +1,38 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies (single layer with cleanup)
+RUN apt-get update -y && apt-get upgrade -y \
+    && echo "tzdata tzdata/Areas select America" | debconf-set-selections \
+    && echo "tzdata tzdata/Zones/America select Los_Angeles" | debconf-set-selections \
+    && apt-get install -y --no-install-recommends \
+        git curl wget build-essential ca-certificates \
+        python3-dev python3.11-dev gcc g++ gfortran \
+        libopenblas-dev liblapack-dev pkg-config \
+    && ln -s /usr/include/locale.h /usr/include/xlocale.h \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (pinned version)
+RUN curl -LsSf https://astral.sh/uv/0.6.0/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN git clone --filter=blob:none https://github.com/numpy/numpy.git testbed
+
+WORKDIR /testbed
+
+ARG BASE_COMMIT
+RUN git checkout ${BASE_COMMIT}
+
+RUN git submodule update --init --recursive
+
+COPY install.sh /testbed/install.sh
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    bash install.sh
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install tree_sitter_languages
+
+ENV VIRTUAL_ENV=/testbed/.venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"

@@ -1,0 +1,42 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies (single layer with cleanup)
+RUN apt-get update -y && apt-get upgrade -y \
+    && echo "tzdata tzdata/Areas select America" | debconf-set-selections \
+    && echo "tzdata tzdata/Zones/America select Los_Angeles" | debconf-set-selections \
+    && apt-get install -y --no-install-recommends \
+        git curl wget build-essential ca-certificates \
+        python3-dev libjpeg-dev libwebp-dev gcc g++ gfortran \
+        libopenblas-dev liblapack-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# NVM + Node.js (required by aiohttp build)
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+ENV NVM_DIR=/root/.nvm
+RUN . "$NVM_DIR/nvm.sh" && nvm install 20 && nvm use 20
+ENV PATH="/root/.nvm/versions/node/v20/bin/:${PATH}"
+
+# Install uv (pinned version)
+RUN curl -LsSf https://astral.sh/uv/0.6.0/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN git clone --filter=blob:none https://github.com/aio-libs/aiohttp.git testbed
+
+WORKDIR /testbed
+
+ARG BASE_COMMIT
+RUN git checkout ${BASE_COMMIT}
+
+COPY process_aiohttp_updateasyncio.py /testbed/process_aiohttp_updateasyncio.py
+COPY install.sh /testbed/install.sh
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    bash install.sh
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install tree_sitter_languages
+
+ENV VIRTUAL_ENV=/testbed/.venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
