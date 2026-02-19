@@ -13,6 +13,8 @@ Environment variables:
 
 from __future__ import annotations
 
+import subprocess
+
 import typer
 
 from r2e_docker.config import DockerBuildConfig, RepoName
@@ -144,6 +146,33 @@ def build_from_dataset(
 @app.command("push")
 def push(image_name: str) -> bool:
     return push_image(image_name)
+
+
+@app.command("validate")
+def validate(
+    image: str,
+    timeout: int = 120,
+) -> None:
+    """Run tests inside a built Docker image to validate it works."""
+    try:
+        res = subprocess.run(
+            ["docker", "run", "--rm", image, "bash", "run_tests.sh"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"TIMEOUT after {timeout}s")
+        raise typer.Exit(code=2)
+
+    print(res.stdout)
+    if res.returncode != 0:
+        print(f"FAILED (exit code {res.returncode})")
+        if res.stderr:
+            print(res.stderr)
+        raise typer.Exit(code=1)
+    else:
+        print("PASSED")
 
 
 def main() -> None:

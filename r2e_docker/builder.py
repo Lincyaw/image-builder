@@ -72,19 +72,26 @@ def build_base_image(config: DockerBuildConfig, reference_commit: str) -> str:
             f"docker build -t {base_image_name} "
             f'--build-arg BASE_COMMIT="{reference_commit}" .',
             cwd=tmpdir,
-            capture_output=False,
+            capture_output=True,
             timeout=config.base_build_timeout,
         )
 
         if res.returncode != 0:
-            print("Failed to build base image. See docker build logs above.")
-            raise RuntimeError(f"Base image build failed for {config.repo_name.value}")
+            print("Failed to build base image.")
+            log = (res.stdout or "") + (res.stderr or "")
+            raise RuntimeError(
+                f"Base image build failed for {config.repo_name.value}\n{log}"
+            )
 
     print(f"Successfully built base image {base_image_name}")
     return base_image_name
 
 
-def generate_commit_dockerfile(config: DockerBuildConfig) -> str:
+def generate_commit_dockerfile(
+    config: DockerBuildConfig,
+    extra_run_lines: list[str] | None = None,
+    pre_install_copies: list[str] | None = None,
+) -> str:
     """Generate a thin Dockerfile for a per-commit image.
 
     This Dockerfile builds FROM the base image, checks out the target commit,
@@ -92,6 +99,11 @@ def generate_commit_dockerfile(config: DockerBuildConfig) -> str:
 
     Args:
         config: Docker build configuration.
+        extra_run_lines: Optional extra RUN lines to append after COPY r2e_tests
+            (e.g. for copying repo-specific files into r2e_tests at build time).
+        pre_install_copies: Optional list of filenames to COPY into /testbed/
+            before running install.sh --quick (e.g. migration scripts deleted
+            by git clean -fd).
 
     Returns:
         Dockerfile content as a string.
@@ -105,12 +117,22 @@ def generate_commit_dockerfile(config: DockerBuildConfig) -> str:
         "WORKDIR /testbed",
         "",
         "# Base image already contains full git history; just checkout target commit locally",
-        "RUN git reset --hard && git clean -fd && git checkout -f ${OLD_COMMIT}",
+        "# Use -fdx to also remove gitignored build artifacts (__config__.py, .so, .c)",
+        "# that were generated during the base build and may interfere with old commits.",
+        "# Exclude .venv to preserve the base image's virtual environment.",
+        "RUN git reset --hard && git clean -fdx -e .venv && git checkout -f ${OLD_COMMIT}",
     ]
 
     # Some repos need submodule update after checkout
     if config.needs_submodule_update:
         lines.append("RUN git submodule update --init --recursive")
+
+    # Copy any files that need to exist before install (e.g. migration scripts
+    # that were in the base image but got deleted by git clean -fd)
+    if pre_install_copies:
+        lines.append("")
+        for filename in pre_install_copies:
+            lines.append(f"COPY {filename} /testbed/{filename}")
 
     # Re-run install in quick mode (reuses existing .venv, only reinstalls editable)
     lines.extend(
@@ -127,10 +149,15 @@ def generate_commit_dockerfile(config: DockerBuildConfig) -> str:
         [
             "",
             "COPY run_tests.sh /testbed/run_tests.sh",
-            "COPY r2e_tests /r2e_tests",
-            "",
+            "COPY r2e_tests /testbed/r2e_tests",
         ]
     )
+
+    if extra_run_lines:
+        lines.append("")
+        lines.extend(extra_run_lines)
+
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -139,7 +166,7 @@ def build_commit_image(
     config: DockerBuildConfig,
     old_commit_hash: str,
     build_context_dir: str | Path,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Build a thin per-commit Docker image FROM the shared base image.
 
     Args:
@@ -148,7 +175,8 @@ def build_commit_image(
         build_context_dir: Directory containing install.sh, run_tests.sh, r2e_tests/, and Dockerfile.
 
     Returns:
-        The image name on success, None on failure.
+        A tuple (image_name, log) where image_name is the built image on success (None on
+        failure) and log contains captured output on failure (None on success).
     """
     commit_image = config.commit_image_name(old_commit_hash)
     build_context_dir = Path(build_context_dir)
@@ -161,7 +189,7 @@ def build_commit_image(
         )
         if res.returncode == 0:
             print(f"Commit image {commit_image} already exists, skipping build")
-            return commit_image
+            return commit_image, None
 
     # Generate Dockerfile if not already present
     dockerfile_path = build_context_dir / "Dockerfile"
@@ -176,20 +204,20 @@ def build_commit_image(
         f"docker build --memory {memory_bytes} "
         f"-t {commit_image} . "
         f'--build-arg OLD_COMMIT="{old_commit_hash}"',
-        capture_output=False,
+        capture_output=True,
         cwd=build_context_dir,
         timeout=config.commit_build_timeout,
     )
 
     if res.returncode != 0:
-        print("Failed to build commit image. See docker build logs above.")
-        return None
+        print("Failed to build commit image.")
+        return None, (res.stdout or "") + (res.stderr or "")
 
     if config.push:
         if not push_image(commit_image):
-            return None
+            return None, ""
 
-    return commit_image
+    return commit_image, None
 
 
 def push_image(image_name: str) -> bool:

@@ -1,7 +1,7 @@
 # Quick mode: reuse existing venv, just reinstall editable package
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    pip install -e . --no-deps 2>/dev/null || pip install -e .
+    uv pip install -e .
     # Re-run asyncio migration if the script exists
     if [ -f "process_aiohttp_updateasyncio.py" ]; then
         .venv/bin/python process_aiohttp_updateasyncio.py

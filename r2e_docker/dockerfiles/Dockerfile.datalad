@@ -4,6 +4,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN sed -i 's@http://\(archive\|security\).ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g; s@https://\(archive\|security\).ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' /etc/apt/sources.list
 
+# Fix GPG signature validation issues with aliyun mirror
+RUN echo 'Acquire::AllowInsecureRepositories "true";\nAcquire::AllowDowngradeToInsecureRepositories "true";' > /etc/apt/apt.conf.d/99insecure
+
 # System dependencies (single layer with cleanup)
 RUN apt-get update -y && apt-get upgrade -y \
     && echo "tzdata tzdata/Areas select America" | debconf-set-selections \

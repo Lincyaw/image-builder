@@ -1,17 +1,27 @@
 #!/bin/bash
 
-set -e  # Exit on any error
+set -e
 
-# Quick mode: reuse existing venv, just rebuild extensions
+# Clean ALL generated/untracked files from previous builds.
+# Critical: __config__.py files left from the reference commit cause _INSTALLED=True
+# in numpy/distutils/__init__.py, which triggers circular imports via numpy.testing.
+# Also removes stale .so files, .pxd files from newer numpy, etc.
+# Using git clean -fdx ensures a pristine source tree matching the checked-out commit.
+git clean -fdx -e '.venv' 2>/dev/null || true
+
+# Quick mode: try to reuse existing venv, fall back to full rebuild if needed
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    python setup.py build_ext --inplace 2>/dev/null || pip install -e . --no-deps 2>/dev/null || pip install -e .
-    exit 0
+    # Try quick rebuild: works when the checked-out commit is compatible with base venv
+    if .venv/bin/python setup.py build_ext --inplace 2>/dev/null; then
+        exit 0
+    fi
+    echo "[INFO] Quick rebuild failed (numpy bootstrap problem), falling back to full rebuild..."
+    # Fall through to full install below
 fi
 
 check_numpy() {
-    echo "Verifying NumPy installation..."
-    if .venv/bin/python -c "import numpy; numpy.array([1,2])" &> /dev/null; then
+    if .venv/bin/python -c "import numpy; numpy.array([1,2])" &>/dev/null; then
         echo "✅ NumPy installation successful!"
         return 0
     else
@@ -20,45 +30,38 @@ check_numpy() {
     fi
 }
 
-
-try_install_python37() {
-    echo "Attempting installation with Python 3.7..."
-    uv venv --clear --python 3.7 --python-preference only-managed || return 1
+try_install() {
+    local pyver="$1"
+    shift
+    echo "--- Trying Python ${pyver} ---"
+    uv venv --clear --python "${pyver}" --python-preference only-managed || return 1
     source .venv/bin/activate
-    uv pip install "setuptools<=59.8.0" "cython<0.30" pytest pytest-env hypothesis nose
-    .venv/bin/python setup.py build_ext --inplace
+    uv pip install "$@" || return 1
+    if [ -f "pyproject.toml" ] && grep -q "meson\|build-backend" pyproject.toml 2>/dev/null; then
+        uv pip install --no-build-isolation -e . || return 1
+    else
+        .venv/bin/python setup.py build_ext --inplace || return 1
+    fi
     check_numpy
 }
 
-try_install_python310() {
-    echo "Attempting installation with Python 3.10..."
-    uv venv --clear --python 3.10 --python-preference only-managed || return 1
-    source .venv/bin/activate
-    uv pip install "setuptools<=59.8.0" "cython<0.30" pytest pytest-env hypothesis nose
-    .venv/bin/python setup.py build_ext --inplace
-    check_numpy
-}
+# Try in order: most compatible first for old numpy 1.x source builds.
+# Python 3.8 + Cython 0.29.x is the sweet spot for numpy 1.x era commits.
+# Python 3.9 as backup. Avoid 3.10+ for old source (C API breaking changes).
+try_install 3.8 \
+    "setuptools==59.8.0" "cython==0.29.37" "wheel" \
+    pytest pytest-env hypothesis nose \
+    && exit 0
 
-main() {
-    echo "Starting NumPy installation attempts..."
-    
-    # Try Python 3.7 installation
-    if try_install_python37; then
-        echo "Successfully installed NumPy using Python 3.7"
-        return 0
-    fi
-    
-    echo "Python 3.7 installation failed, trying Python 3.10..."
-    
-    # Try Python 3.11 installation
-    if try_install_python310; then
-        echo "Successfully installed NumPy using Python 3.10"
-        return 0
-    fi
-    
-    echo "All installation attempts failed"
-    return 1
-}
+try_install 3.9 \
+    "setuptools==59.8.0" "cython==0.29.37" "wheel" \
+    pytest pytest-env hypothesis nose \
+    && exit 0
 
-# Run the main function
-main
+try_install 3.10 \
+    "setuptools==59.8.0" "cython==0.29.37" "wheel" \
+    pytest pytest-env hypothesis nose \
+    && exit 0
+
+echo "All installation attempts failed"
+exit 1

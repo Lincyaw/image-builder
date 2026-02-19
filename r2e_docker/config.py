@@ -35,12 +35,13 @@ REPOS_WITH_SUBMODULES: set[RepoName] = {RepoName.numpy, RepoName.orange3}
 
 REPO_EXTRA_BASE_FILES: dict[RepoName, list[str]] = {
     RepoName.aiohttp: ["process_aiohttp_updateasyncio.py"],
+    RepoName.orange3: ["orange3_conftest.py"],
 }
 
 REPO_TEST_COMMANDS: dict[RepoName, str] = {
-    # tornado, statsmodels, mypy are omitted — they use custom runners or are not implemented.
+    RepoName.tornado: ".venv/bin/python -W ignore r2e_tests/tornado_unittest_runner.py",
     RepoName.sympy: "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' .venv/bin/python -W ignore -m pytest -rA r2e_tests",
-    RepoName.pandas: "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' .venv/bin/python -W ignore -m pytest -rA r2e_tests",
+    RepoName.pandas: "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' .venv/bin/python -W ignore -m pytest -rA -o 'addopts=' r2e_tests",
     RepoName.numpy: "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' .venv/bin/python -W ignore -m pytest -rA r2e_tests",
     RepoName.scrapy: "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' .venv/bin/python -W ignore -m pytest -rA r2e_tests",
     RepoName.pillow: "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' .venv/bin/python -W ignore -m pytest -rA r2e_tests",
@@ -108,5 +109,7 @@ class DockerBuildConfig(BaseModel):
     def tests_cmd(self) -> str:
         cmd = REPO_TEST_COMMANDS.get(self.repo_name)
         if cmd is None:
-            raise NotImplementedError(f"tests_cmd not defined for {self.repo_name.value}")
+            raise NotImplementedError(
+                f"tests_cmd not defined for {self.repo_name.value}"
+            )
         return cmd

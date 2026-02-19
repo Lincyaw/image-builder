@@ -46,11 +46,11 @@ app = typer.Typer(help="Batch build Docker images.")
 # These can be overridden via --reference_commits JSON file.
 DEFAULT_REFERENCE_COMMITS: dict[str, str] = {
     "sympy": "98f087276dc2",
-    "pandas": "2a6539c890c8",
+    "pandas": "refs/tags/v1.3.5",
     "numpy": "refs/tags/v1.24.4",
     "scrapy": "b1065b5d4062",
     "tornado": "d4db9c1a7798",
-    "pillow": "5bff4a3253c8",
+    "pillow": "refs/tags/9.5.0",
     "pyramid": "a1a1e8c36580",
     "datalad": "a1b6f2f2e2c2",
     "aiohttp": "4c72e78e19af",
@@ -71,6 +71,131 @@ def _parse_docker_image(docker_image: str) -> tuple[str, str]:
     return repo, tag
 
 
+def _apply_repo_heuristics(
+    config: DockerBuildConfig,
+    test_file_codes: list[str],
+    test_file_names: list[str],
+    tests_dir: Path,
+) -> tuple[str | None, list[str], list[str]]:
+    """Apply repo-specific transformations to test files and build context.
+
+    Ports logic from old repo_testextract.py lines 127-229 and repo_testheuristics.py.
+
+    Args:
+        config: Docker build configuration.
+        test_file_codes: Mutable list of test file contents.
+        test_file_names: Mutable list of test file names.
+        tests_dir: Path to the r2e_tests directory in the build context.
+
+    Returns:
+        A tuple of (test_cmd_override, extra_dockerfile_lines, pre_install_copies).
+        test_cmd_override is a replacement test command or None.
+        extra_dockerfile_lines are RUN lines to append to the Dockerfile.
+        pre_install_copies are filenames to COPY before install.sh --quick.
+    """
+    repo = config.repo_name
+    test_cmd_override = None
+    extra_dockerfile_lines: list[str] = []
+    pre_install_copies: list[str] = []
+
+    if repo == RepoName.numpy:
+        # Replace old nosetest setup/teardown with pytest equivalents
+        for i in range(len(test_file_codes)):
+            test_file_codes[i] = (
+                test_file_codes[i]
+                .replace("def setup(self)", "def setup_method(self)")
+                .replace("def teardown(self)", "def teardown_method(self)")
+            )
+        # NOTE: Relative import fixes (from ... -> absolute) require old_file_names
+        # which are not stored in the HuggingFace dataset. The dataset's test files
+        # already have these fixes applied from the original extraction.
+
+    elif repo == RepoName.datalad:
+        # Copy datalads_conftest.py as conftest.py (also handled by static copy below,
+        # but ensure it's present even if the dataset already includes one)
+        conftest_src = config.helpers_dir / "datalads_conftest.py"
+        if conftest_src.exists() and "conftest.py" not in test_file_names:
+            shutil.copy(conftest_src, tests_dir / "conftest.py")
+        # NOTE: Relative import fixes require old_file_names (same as numpy).
+
+    elif repo == RepoName.pyramid:
+        # The old code prepended "import pyramid.tests" to test files containing
+        # sys.modules. In the dataset, this was already applied during extraction.
+        # Copy fixtures/test_config/test_scripts directories from the repo inside
+        # the container (the repo is at /testbed after checkout).
+        extra_dockerfile_lines.append(
+            "# Copy pyramid test support directories from repo into r2e_tests"
+        )
+        extra_dockerfile_lines.append(
+            "RUN for dir in fixtures test_config test_scripts; do "
+            'if [ -d "tests/$dir" ]; then cp -r "tests/$dir" /testbed/r2e_tests/; fi; '
+            'if [ -d "pyramid/tests/$dir" ]; then cp -r "pyramid/tests/$dir" /testbed/r2e_tests/; fi; '
+            "done"
+        )
+
+    elif repo == RepoName.pillow:
+        # If any test file uses unittest, switch to custom unittest runner
+        if any("unittest" in code for code in test_file_codes):
+            # Add the runner to test files if not already present
+            if "unittest_custom_runner.py" not in test_file_names:
+                runner_src = config.helpers_dir / "unittest_custom_runner.py"
+                if runner_src.exists():
+                    shutil.copy(runner_src, tests_dir / "unittest_custom_runner.py")
+            test_cmd_override = (
+                ".venv/bin/python -W ignore r2e_tests/unittest_custom_runner.py"
+            )
+        # Copy Tests/helper.py from repo if it exists (Pillow helper module)
+        extra_dockerfile_lines.append(
+            "# Copy Pillow test helper if available"
+        )
+        extra_dockerfile_lines.append(
+            "RUN cp Tests/helper.py /testbed/r2e_tests/helper.py 2>/dev/null || true"
+        )
+
+    elif repo == RepoName.tornado:
+        # Add tornado unittest runner to test files if not already present
+        if "tornado_unittest_runner.py" not in test_file_names:
+            runner_src = config.helpers_dir / "tornado_unittest_runner.py"
+            if runner_src.exists():
+                shutil.copy(runner_src, tests_dir / "tornado_unittest_runner.py")
+        # Test command is set in REPO_TEST_COMMANDS (config.py)
+        # Copy test data files from the tornado source tree that tests reference
+        # via __file__-relative paths (e.g. options_test.cfg, SSL certs, etc.)
+        extra_dockerfile_lines.append(
+            "# Copy tornado test data files from repo into r2e_tests"
+        )
+        extra_dockerfile_lines.append(
+            "RUN for f in tornado/test/*.cfg tornado/test/*.crt tornado/test/*.key tornado/test/*.txt; do "
+            "cp \"$f\" /testbed/r2e_tests/ 2>/dev/null || true; "
+            "done; "
+            "for d in tornado/test/csv_translations tornado/test/gettext_translations "
+            "tornado/test/static tornado/test/templates; do "
+            'if [ -d "$d" ]; then cp -r "$d" /testbed/r2e_tests/; fi; '
+            "done"
+        )
+
+    elif repo == RepoName.aiohttp:
+        # Copy tests/conftest.py from repo inside the container if not already
+        # in test files (the dataset usually includes it from extraction)
+        if "conftest.py" not in test_file_names:
+            extra_dockerfile_lines.append(
+                "# Copy aiohttp test conftest from repo"
+            )
+            extra_dockerfile_lines.append(
+                "RUN cp tests/conftest.py /testbed/r2e_tests/conftest.py 2>/dev/null || true"
+            )
+        # process_aiohttp_updateasyncio.py is created in the base image but gets
+        # deleted by `git clean -fd` during commit checkout. Copy it into the
+        # build context so it can be restored before install.sh --quick runs.
+        migration_script = "process_aiohttp_updateasyncio.py"
+        migration_src = config.helpers_dir / migration_script
+        if migration_src.exists():
+            shutil.copy(migration_src, tests_dir.parent / migration_script)
+            pre_install_copies.append(migration_script)
+
+    return test_cmd_override, extra_dockerfile_lines, pre_install_copies
+
+
 def _prepare_build_context(
     config: DockerBuildConfig,
     commit_hash: str,
@@ -79,12 +204,30 @@ def _prepare_build_context(
     dest_dir: Path,
 ) -> None:
     """Create a build context directory for a commit image."""
-    dockerfile_content = generate_commit_dockerfile(config)
-    (dest_dir / "Dockerfile").write_text(dockerfile_content)
-
     shutil.copy(config.install_script, dest_dir / "install.sh")
 
-    tests_cmd = REPO_TEST_COMMANDS.get(config.repo_name)
+    tests_dir = dest_dir / "r2e_tests"
+    tests_dir.mkdir(exist_ok=True)
+    (tests_dir / "__init__.py").write_text("")
+
+    # Apply repo-specific heuristics (may mutate test_file_codes/names, copy files)
+    test_cmd_override, extra_dockerfile_lines, pre_install_copies = _apply_repo_heuristics(
+        config, test_file_codes, test_file_names, tests_dir
+    )
+
+    # Write test files (after heuristics may have modified them)
+    for code, name in zip(test_file_codes, test_file_names):
+        (tests_dir / name).write_text(code)
+
+    # Copy repo-specific conftest into r2e_tests/ so pytest picks it up automatically
+    conftest_src = config.helpers_dir / f"{config.repo_name.value}_conftest.py"
+    if conftest_src.exists():
+        shutil.copy(conftest_src, tests_dir / "conftest.py")
+
+    # Determine test command
+    tests_cmd = test_cmd_override
+    if tests_cmd is None:
+        tests_cmd = REPO_TEST_COMMANDS.get(config.repo_name)
     if tests_cmd is None:
         tests_cmd = (
             "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' "
@@ -92,15 +235,17 @@ def _prepare_build_context(
         )
     (dest_dir / "run_tests.sh").write_text(tests_cmd)
 
-    tests_dir = dest_dir / "r2e_tests"
-    tests_dir.mkdir(exist_ok=True)
-    (tests_dir / "__init__.py").write_text("")
-    for code, name in zip(test_file_codes, test_file_names):
-        (tests_dir / name).write_text(code)
+    # Generate Dockerfile with any extra repo-specific lines
+    dockerfile_content = generate_commit_dockerfile(
+        config,
+        extra_run_lines=extra_dockerfile_lines or None,
+        pre_install_copies=pre_install_copies or None,
+    )
+    (dest_dir / "Dockerfile").write_text(dockerfile_content)
 
 
-def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None]:
-    """Build a single commit image. Returns (key, built_name | None, error)."""
+def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | None]:
+    """Build a single commit image. Returns (key, built_name | None, error, log | None)."""
     (
         repo_str,
         commit_hash,
@@ -119,7 +264,7 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None]:
             push=do_push,
         )
     except ValueError:
-        return (f"{repo_str}:{commit_hash}", None, f"Unknown repo: {repo_str}")
+        return (f"{repo_str}:{commit_hash}", None, f"Unknown repo: {repo_str}", None)
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -127,12 +272,12 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None]:
             _prepare_build_context(
                 config, commit_hash, test_file_codes, test_file_names, tmpdir
             )
-            result = build_commit_image(config, commit_hash, tmpdir)
+            result, log = build_commit_image(config, commit_hash, tmpdir)
         if result is None:
-            return (f"{repo_str}:{commit_hash}", None, "docker build failed")
-        return (f"{repo_str}:{commit_hash}", result, None)
+            return (f"{repo_str}:{commit_hash}", None, "docker build failed", log)
+        return (f"{repo_str}:{commit_hash}", result, None, None)
     except Exception as e:
-        return (f"{repo_str}:{commit_hash}", None, str(e))
+        return (f"{repo_str}:{commit_hash}", None, str(e), None)
 
 
 def _build_one_base(
@@ -152,6 +297,9 @@ def _build_one_base(
     try:
         image = build_base_image(config, commit_hash)
         return (repo_str, image, None)
+    except RuntimeError as e:
+        # RuntimeError message may contain the captured build log
+        return (repo_str, None, str(e))
     except Exception as e:
         return (repo_str, None, str(e))
 
@@ -235,6 +383,7 @@ def build_from_dataset(
     push: bool = False,
     base_only: bool = False,
     limit: int | None = None,
+    output_dir: str = "output",
 ) -> None:
     """Build Docker images from a HuggingFace dataset (streaming, no full download).
 
@@ -247,10 +396,15 @@ def build_from_dataset(
         push: Push images after building.
         base_only: Only build base images, skip commit images.
         limit: Max number of commit images to build (None = all).
+        output_dir: Directory to save failure logs for debugging.
     """
     from datasets import load_dataset as _load
 
     reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "namanjain12/")
+
+    log_dir = Path(output_dir) / "failed_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    console.print(f"Failure logs will be saved to: [cyan]{log_dir}[/cyan]")
 
     console.print(f"Loading dataset {dataset} split={split} ...")
     # Don't use streaming=True to allow caching (avoid re-downloading)
@@ -327,9 +481,11 @@ def build_from_dataset(
                     else:
                         msg = error or "unknown error"
                         base_failed.append((repo, msg))
-                        console.print(
-                            f"[red]Failed to build base for {repo}: {msg}[/red]"
-                        )
+                        console.print(f"[red]Failed to build base for {repo}[/red]")
+                        # Save failure log
+                        log_file = log_dir / f"base_{repo}.log"
+                        log_file.write_text(msg)
+                        console.print(f"  Log saved: [yellow]{log_file}[/yellow]")
                     progress.advance(task_id)
 
     _print_summary(
@@ -368,12 +524,21 @@ def build_from_dataset(
             console=console,
         ) as progress:
             task_id = progress.add_task("Building commit images", total=len(all_tasks))
-            for key, result, error in pool.imap_unordered(_build_one_commit, all_tasks):
+            for key, result, error, log in pool.imap_unordered(
+                _build_one_commit, all_tasks
+            ):
                 if result:
                     success += 1
                 else:
                     msg = error or "unknown error"
                     failed.append(f"{key}: {msg}")
+                    # Save failure log
+                    safe_key = key.replace("/", "_").replace(":", "_")
+                    log_file = log_dir / f"commit_{safe_key}.log"
+                    log_content = f"Error: {msg}\n"
+                    if log:
+                        log_content += f"\n--- Docker Build Output ---\n{log}"
+                    log_file.write_text(log_content)
                 progress.advance(task_id)
 
     _print_summary(

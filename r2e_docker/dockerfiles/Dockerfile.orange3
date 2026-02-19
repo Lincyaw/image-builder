@@ -4,6 +4,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN sed -i 's@http://\(archive\|security\).ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g; s@https://\(archive\|security\).ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' /etc/apt/sources.list
 
+# Fix GPG signature validation issues with aliyun mirror
+RUN echo 'Acquire::AllowInsecureRepositories "true";\nAcquire::AllowDowngradeToInsecureRepositories "true";' > /etc/apt/apt.conf.d/99insecure
+
 # System dependencies (single layer with cleanup)
 RUN apt-get update -y && apt-get upgrade -y \
     && echo "tzdata tzdata/Areas select America" | debconf-set-selections \
@@ -21,7 +24,7 @@ RUN apt-get update -y && apt-get upgrade -y \
         libxcb-sync1 libxcb-sync-dev \
         libxcb-xfixes0-dev libxcb-shape0-dev libxcb-randr0-dev \
         libxcb-render-util0 libxcb-render-util0-dev libxcb-glx0-dev \
-        xvfb \
+        xvfb libfontconfig1 \
     && ln -s /usr/include/locale.h /usr/include/xlocale.h \
     && rm -rf /var/lib/apt/lists/*
 
@@ -59,6 +62,8 @@ WORKDIR /testbed
 RUN git submodule update --init --recursive
 
 COPY install.sh /testbed/install.sh
+# Copy Orange3-specific pytest conftest for headless Qt environment
+COPY orange3_conftest.py /testbed/orange3_conftest.py
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/pip \
     bash install.sh

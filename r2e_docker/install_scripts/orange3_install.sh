@@ -2,11 +2,15 @@
 
 set -e  # Exit on any error
 
-# Quick mode: reuse existing venv, just rebuild extensions
+# Quick mode: reuse existing venv, rebuild extensions for the checked-out commit
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    python setup.py build_ext --inplace 2>/dev/null || true
-    python setup.py develop 2>/dev/null || pip install -e . --no-deps 2>/dev/null || pip install -e .
+    # Clean old compiled files
+    find . -name '*.pyc' -delete 2>/dev/null || true
+    find . -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+    # Rebuild C extensions and reinstall in develop mode
+    .venv/bin/python setup.py build_ext --inplace
+    .venv/bin/python setup.py develop || uv pip install -e .
     exit 0
 fi
 
@@ -35,8 +39,10 @@ try_install_python37() {
         uv pip install -r requirements-opt.txt
     fi
     uv pip install scipy scikit-learn
-    .venv/bin/python setup.py build_ext --inplace  
+    .venv/bin/python setup.py build_ext --inplace
     .venv/bin/python setup.py develop
+    # Re-pin setuptools after develop (pip may have upgraded it)
+    uv pip install "setuptools<60" --force-reinstall
     check_orange
 }
 
@@ -44,15 +50,17 @@ try_install_python38() {
     echo "Attempting installation with Python 3.8..."
     uv venv --clear --python 3.8 --python-preference only-managed || return 1
     source .venv/bin/activate
-    uv pip install --upgrade setuptools numpy wheel "cython<0.30" pytest "PyQt5>=5.12,!=5.15.1" "PyQtWebEngine>=5.12"
+    uv pip install --upgrade "setuptools<60" "numpy<1.25" wheel "cython<0.30" pytest "PyQt5>=5.12,!=5.15.1" "PyQtWebEngine>=5.12"
     uv pip install -r requirements-core.txt
     uv pip install -r requirements-gui.txt
-    uv pip install -r requirements-sql.txt
+    uv pip install -r requirements-sql.txt --ignore-errors || uv pip install -r requirements-sql.txt --ignore-errors 2>/dev/null || true
     if [ -f requirements-opt.txt ]; then
-        uv pip install -r requirements-opt.txt
+        uv pip install -r requirements-opt.txt || true
     fi
-    .venv/bin/python setup.py build_ext --inplace  
+    .venv/bin/python setup.py build_ext --inplace
     .venv/bin/python setup.py develop
+    # Re-pin setuptools after develop (pip may have upgraded it)
+    uv pip install "setuptools<60" --force-reinstall
     check_orange
 }
 
@@ -60,16 +68,19 @@ try_install_python310() {
     echo "Attempting installation with Python 3.10..."
     uv venv --clear --python 3.10 --python-preference only-managed || return 1
     source .venv/bin/activate
-    uv pip install --upgrade setuptools numpy wheel cython pytest "PyQt5>=5.12,!=5.15.1" "PyQtWebEngine>=5.12"
+    # setuptools<60 is required for numpy.distutils compatibility on Python 3.10
+    uv pip install --upgrade "setuptools<60" numpy wheel cython pytest "PyQt5>=5.12,!=5.15.1" "PyQtWebEngine>=5.12"
     uv pip install -r requirements-core.txt
     uv pip install -r requirements-gui.txt
     if [ -f requirements-dev.txt ]; then
-        uv pip install -r requirements-dev.txt
+        uv pip install -r requirements-dev.txt || true
     fi
-    uv pip install -r requirements-sql.txt
-    .venv/bin/python setup.py build_ext --inplace  
+    uv pip install -r requirements-sql.txt --ignore-errors || uv pip install -r requirements-sql.txt --ignore-errors 2>/dev/null || true
+    .venv/bin/python setup.py build_ext --inplace
     .venv/bin/python setup.py develop
-    uv pip install -e . --no-binary=orange3
+    # Re-pin setuptools after develop (pip may have upgraded it)
+    uv pip install "setuptools<60" --force-reinstall
+    uv pip install -e . --no-binary=orange3 --no-deps 2>/dev/null || true
     check_orange
 }
 

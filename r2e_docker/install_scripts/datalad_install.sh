@@ -4,7 +4,7 @@ set -e
 # Quick mode: reuse existing venv, just reinstall editable package
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    pip install -e . --no-deps 2>/dev/null || pip install -e .
+    uv pip install -e .
     exit 0
 fi
 
@@ -23,7 +23,7 @@ test_39_install () {
     uv venv --python 3.9
     source .venv/bin/activate
 
-    uv pip install setuptools pytest pytest-cov numpy 'pybids<0.7.0'
+    uv pip install setuptools "pytest<8" pytest-cov numpy 'pybids<0.7.0' nose
     uv pip install -e .[full]
     uv pip install -e .[devel]
 
@@ -35,7 +35,7 @@ test_37_install () {
     uv venv --python 3.7
     source .venv/bin/activate
 
-    uv pip install setuptools pytest pytest-cov numpy 'pybids<0.7.0' fasteners bids
+    uv pip install setuptools "pytest<8" pytest-cov numpy 'pybids<0.7.0' fasteners bids nose
     uv pip install -e .[full]
     uv pip install -e .[devel]
 

@@ -11,7 +11,7 @@ set -e
 # Quick mode: reuse existing venv, just reinstall editable package
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    pip install -e . --no-deps 2>/dev/null || pip install -e . 2>/dev/null || python setup_direct.py develop 2>/dev/null || true
+    uv pip install -e . 2>/dev/null || python setup_direct.py develop 2>/dev/null || true
     exit 0
 fi
 
