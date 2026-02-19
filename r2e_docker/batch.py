@@ -38,6 +38,7 @@ from r2e_docker.builder import (
     generate_commit_dockerfile,
     init_push_semaphore,
 )
+from r2e_docker.validator import validate_image, delete_image
 
 console = Console()
 app = typer.Typer(help="Batch build Docker images.")
@@ -64,7 +65,7 @@ DEFAULT_REFERENCE_COMMITS: dict[str, str] = {
 def _parse_docker_image(docker_image: str) -> tuple[str, str]:
     """Extract (repo_name, commit_hash) from docker_image string.
 
-    e.g. 'namanjain12/sympy_final:abc123' -> ('sympy', 'abc123')
+    e.g. 'arl/sympy_final:abc123' -> ('sympy', 'abc123')
     """
     name_tag = docker_image.rsplit("/", 1)[-1]
     name, tag = name_tag.rsplit(":", 1)
@@ -241,8 +242,8 @@ def _prepare_build_context(
     (dest_dir / "Dockerfile").write_text(dockerfile_content)
 
 
-def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | None]:
-    """Build a single commit image. Returns (key, built_name | None, error, log | None)."""
+def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | None, str | None]:
+    """Build a single commit image. Returns (key, built_name | None, build_error, build_log, validation_error)."""
     (
         repo_str,
         commit_hash,
@@ -251,6 +252,10 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | N
         registry,
         rebuild,
         do_push,
+        do_validate,
+        expected_output_json,
+        validation_timeout,
+        new_commit_hash,
     ) = args
 
     try:
@@ -261,7 +266,7 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | N
             push=do_push,
         )
     except ValueError:
-        return (f"{repo_str}:{commit_hash}", None, f"Unknown repo: {repo_str}", None)
+        return (f"{repo_str}:{commit_hash}", None, f"Unknown repo: {repo_str}", None, None)
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -271,10 +276,22 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | N
             )
             result, log = build_commit_image(config, commit_hash, tmpdir)
         if result is None:
-            return (f"{repo_str}:{commit_hash}", None, "docker build failed", log)
-        return (f"{repo_str}:{commit_hash}", result, None, None)
+            return (f"{repo_str}:{commit_hash}", None, "docker build failed", log, None)
+
+        # Post-build validation
+        if do_validate and expected_output_json:
+            vr = validate_image(
+                result, expected_output_json,
+                timeout=validation_timeout,
+                new_commit=new_commit_hash,
+            )
+            if not vr.passed:
+                delete_image(result)
+                return (f"{repo_str}:{commit_hash}", None, None, None, vr.detailed_log())
+
+        return (f"{repo_str}:{commit_hash}", result, None, None, None)
     except Exception as e:
-        return (f"{repo_str}:{commit_hash}", None, str(e), None)
+        return (f"{repo_str}:{commit_hash}", None, str(e), None, None)
 
 
 def _build_one_base(
@@ -326,7 +343,7 @@ def build_all_bases(
         push: Push base images to registry after building.
         max_push_concurrency: Max simultaneous docker push calls.
     """
-    reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "namanjain12/")
+    reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "arl/")
 
     if reference_commits:
         with open(reference_commits) as f:
@@ -377,7 +394,7 @@ def build_all_bases(
 
 @app.command("build_from_dataset")
 def build_from_dataset(
-    dataset: str = "R2E-Gym/R2E-Gym-Lite",
+    dataset: str = "R2E-Gym/R2E-Gym-Subset",
     split: str = "train",
     registry: str | None = None,
     max_workers: int = 4,
@@ -386,6 +403,8 @@ def build_from_dataset(
     base_only: bool = False,
     limit: int | None = None,
     output_dir: str = "output",
+    validate: bool = True,
+    validation_timeout: int = 300,
     max_push_concurrency: int = 4,
 ) -> None:
     """Build Docker images from a HuggingFace dataset (streaming, no full download).
@@ -400,13 +419,15 @@ def build_from_dataset(
         base_only: Only build base images, skip commit images.
         limit: Max number of commit images to build (None = all).
         output_dir: Directory to save failure logs for debugging.
+        validate: Run F2P/P2P validation after each build (default True).
+        validation_timeout: Timeout in seconds for validation docker run.
         max_push_concurrency: Max simultaneous docker push calls.
     """
     from datasets import load_dataset as _load
 
-    reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "namanjain12/")
+    reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "arl/")
 
-    log_dir = Path(output_dir) / "failed_logs"
+    log_dir = Path(output_dir) / "r2e_docker" / "failed_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     console.print(f"Failure logs will be saved to: [cyan]{log_dir}[/cyan]")
 
@@ -440,6 +461,23 @@ def build_from_dataset(
                 except (json.JSONDecodeError, TypeError):
                     pass
 
+            # Extract expected test outputs for validation
+            raw_expected = entry.get("expected_output_json", "")
+            expected_out: dict[str, str] = {}
+            if raw_expected:
+                if isinstance(raw_expected, str):
+                    try:
+                        expected_out = json.loads(raw_expected)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                elif isinstance(raw_expected, dict):
+                    expected_out = raw_expected
+
+            # Extract the NEW (fixed) commit hash for step 2 validation.
+            # In the R2E dataset, commit_hash from docker_image IS the new commit.
+            # The old (buggy) commit is commit_hash~1, checked out during build.
+            new_commit_for_validation = entry.get("commit_hash", commit_hash)
+
             all_tasks.append(
                 (
                     repo_str,
@@ -449,6 +487,10 @@ def build_from_dataset(
                     reg,
                     rebuild,
                     push,
+                    validate,
+                    expected_out,
+                    validation_timeout,
+                    new_commit_for_validation,
                 )
             )
 
@@ -521,9 +563,9 @@ def build_from_dataset(
         return
 
     success = 0
-    failed: list[str] = []
-    sem = Semaphore(max_push_concurrency)
-    with Pool(max_workers, initializer=init_push_semaphore, initargs=(sem,)) as pool:
+    build_failed: list[str] = []
+    validation_failed: list[str] = []
+    with Pool(max_workers) as pool:
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -532,15 +574,21 @@ def build_from_dataset(
             console=console,
         ) as progress:
             task_id = progress.add_task("Building commit images", total=len(all_tasks))
-            for key, result, error, log in pool.imap_unordered(
+            for key, result, build_error, log, val_error in pool.imap_unordered(
                 _build_one_commit, all_tasks
             ):
                 if result:
                     success += 1
+                elif val_error:
+                    validation_failed.append(f"{key}: validation failed")
+                    # Save validation failure log
+                    safe_key = key.replace("/", "_").replace(":", "_")
+                    log_file = log_dir / f"validation_{safe_key}.log"
+                    log_file.write_text(val_error)
                 else:
-                    msg = error or "unknown error"
-                    failed.append(f"{key}: {msg}")
-                    # Save failure log
+                    msg = build_error or "unknown error"
+                    build_failed.append(f"{key}: {msg}")
+                    # Save build failure log
                     safe_key = key.replace("/", "_").replace(":", "_")
                     log_file = log_dir / f"commit_{safe_key}.log"
                     log_content = f"Error: {msg}\n"
@@ -550,10 +598,24 @@ def build_from_dataset(
                 progress.advance(task_id)
 
     _print_summary(
-        stage="Commit images",
-        success=success,
-        failed_items=failed,
+        stage="Commit images (build)",
+        success=success + len(validation_failed),
+        failed_items=build_failed,
         total=len(all_tasks),
+    )
+    if validation_failed:
+        _print_summary(
+            stage="Commit images (validation)",
+            success=success,
+            failed_items=validation_failed,
+            total=success + len(validation_failed),
+        )
+
+    console.print(
+        f"\n[bold]Final: {success} passed, "
+        f"{len(build_failed)} build failures, "
+        f"{len(validation_failed)} validation failures, "
+        f"{len(all_tasks)} total[/bold]"
     )
 
 
