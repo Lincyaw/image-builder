@@ -13,6 +13,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import typer
@@ -120,7 +121,7 @@ def build_commit(
 
 @app.command("build_from_dataset")
 def build_from_dataset(
-    dataset: str = "R2E-Gym/R2E-Gym-Lite",
+    dataset: str = "R2E-Gym/R2E-Gym-Subset",
     split: str = "train",
     registry: str | None = None,
     max_workers: int = 4,
@@ -128,6 +129,8 @@ def build_from_dataset(
     push: bool = False,
     base_only: bool = False,
     limit: int | None = None,
+    validate: bool = True,
+    validation_timeout: int = 300,
 ) -> None:
     from r2e_docker.batch import build_from_dataset as _build_from_dataset
 
@@ -140,6 +143,8 @@ def build_from_dataset(
         push=push,
         base_only=base_only,
         limit=limit,
+        validate=validate,
+        validation_timeout=validation_timeout,
     )
 
 
@@ -152,8 +157,30 @@ def push(image_name: str) -> bool:
 def validate(
     image: str,
     timeout: int = 120,
+    expected_output: str | None = None,
 ) -> None:
-    """Run tests inside a built Docker image to validate it works."""
+    """Run tests inside a built Docker image to validate it works.
+
+    When --expected-output is provided (JSON string mapping test names to
+    expected status), performs full F2P/P2P validation. Otherwise, just
+    checks the exit code.
+    """
+    if expected_output is not None:
+        from r2e_docker.validator import validate_image as _validate_image
+
+        try:
+            expected = json.loads(expected_output)
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON for --expected-output: {e}")
+            raise typer.Exit(code=2)
+
+        result = _validate_image(image, expected, timeout=timeout)
+        print(result.detailed_log())
+        if not result.passed:
+            raise typer.Exit(code=1)
+        return
+
+    # Simple exit-code validation (original behavior)
     try:
         res = subprocess.run(
             ["docker", "run", "--rm", image, "bash", "run_tests.sh"],
