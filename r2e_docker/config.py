@@ -53,6 +53,12 @@ REPO_TEST_COMMANDS: dict[RepoName, str] = {
     RepoName.bokeh: "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' .venv/bin/python -W ignore -m pytest -rA r2e_tests",
 }
 
+# Per-repo commit build timeout overrides (seconds).
+# Repos with heavy C extension compilation need longer than the default 600s.
+REPO_COMMIT_BUILD_TIMEOUTS: dict[RepoName, int] = {
+    RepoName.numpy: 1800,
+}
+
 
 class DockerBuildConfig(BaseModel):
     repo_name: RepoName

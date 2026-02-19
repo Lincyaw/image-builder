@@ -19,6 +19,28 @@ def init_push_semaphore(sem: Any) -> None:
     _push_semaphore = sem
 
 
+def docker_cleanup() -> None:
+    """Prune dangling images, stopped containers, and build cache to free disk space.
+
+    Safe to call concurrently from worker processes — Docker handles locking internally.
+    """
+    subprocess.run(
+        ["docker", "builder", "prune", "-f", "--filter", "until=1h"],
+        capture_output=True,
+        timeout=120,
+    )
+    subprocess.run(
+        ["docker", "image", "prune", "-f"],
+        capture_output=True,
+        timeout=60,
+    )
+    subprocess.run(
+        ["docker", "container", "prune", "-f"],
+        capture_output=True,
+        timeout=60,
+    )
+
+
 def build_base_image(config: DockerBuildConfig, reference_commit: str) -> str:
     """Build the base image for a repo (run once per repo).
 

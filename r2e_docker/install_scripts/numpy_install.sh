@@ -12,9 +12,17 @@ git clean -fdx -e '.venv' 2>/dev/null || true
 # Quick mode: try to reuse existing venv, fall back to full rebuild if needed
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
+    # Pin setuptools: old numpy commits use legacy build backend without build_editable
+    uv pip install "setuptools==59.8.0" 2>/dev/null || true
     # Try quick rebuild: works when the checked-out commit is compatible with base venv
     if .venv/bin/python setup.py build_ext --inplace 2>/dev/null; then
         exit 0
+    fi
+    # Fallback: try non-editable install to avoid build_editable errors
+    if [ -f "pyproject.toml" ] && grep -q "meson\|build-backend" pyproject.toml 2>/dev/null; then
+        if uv pip install --no-build-isolation . 2>/dev/null; then
+            exit 0
+        fi
     fi
     echo "[INFO] Quick rebuild failed (numpy bootstrap problem), falling back to full rebuild..."
     # Fall through to full install below

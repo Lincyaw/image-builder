@@ -4,7 +4,18 @@ set -e
 # Quick mode: reuse existing venv, just reinstall editable package
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    uv pip install -e .
+
+    # Pin older setuptools: versions >=58 removed easy_install.write_script
+    # which old datalad _datalad_build_support/setup.py depends on
+    uv pip install "setuptools<58.0"
+
+    # Patch platform.dist() calls — removed in Python 3.8+ but used by old
+    # datalad commits in _datalad_build_support/setup.py
+    if [ -f "_datalad_build_support/setup.py" ]; then
+        sed -i "s/platform\.dist()/('', '', '')/g" _datalad_build_support/setup.py 2>/dev/null || true
+    fi
+
+    uv pip install --no-build-isolation -e . || uv pip install -e .
     exit 0
 fi
 

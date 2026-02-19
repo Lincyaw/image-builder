@@ -31,10 +31,11 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from r2e_docker.config import DockerBuildConfig, RepoName, REPO_TEST_COMMANDS
+from r2e_docker.config import DockerBuildConfig, RepoName, REPO_TEST_COMMANDS, REPO_COMMIT_BUILD_TIMEOUTS
 from r2e_docker.builder import (
     build_base_image,
     build_commit_image,
+    docker_cleanup,
     generate_commit_dockerfile,
     init_push_semaphore,
 )
@@ -259,11 +260,14 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | N
     ) = args
 
     try:
+        repo_enum = RepoName(repo_str)
+        timeout_override = REPO_COMMIT_BUILD_TIMEOUTS.get(repo_enum)
         config = DockerBuildConfig(
-            repo_name=RepoName(repo_str),
+            repo_name=repo_enum,
             registry=registry,
             rebuild_commits=rebuild,
             push=do_push,
+            **({"commit_build_timeout": timeout_override} if timeout_override else {}),
         )
     except ValueError:
         return (f"{repo_str}:{commit_hash}", None, f"Unknown repo: {repo_str}", None, None)
@@ -562,9 +566,15 @@ def build_from_dataset(
         _print_summary(stage="Commit images", success=0, failed_items=[], total=0)
         return
 
+    # Prune Docker build cache before starting commit builds to maximize disk space
+    console.print("[dim]Running Docker cleanup before commit builds...[/dim]")
+    docker_cleanup()
+
     success = 0
     build_failed: list[str] = []
     validation_failed: list[str] = []
+    completed_since_cleanup = 0
+    cleanup_interval = 50  # prune every N completed builds
     with Pool(max_workers) as pool:
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -595,7 +605,15 @@ def build_from_dataset(
                     if log:
                         log_content += f"\n--- Docker Build Output ---\n{log}"
                     log_file.write_text(log_content)
+                    # Trigger immediate cleanup on disk space errors
+                    if log and "no space left on device" in log:
+                        docker_cleanup()
+                        completed_since_cleanup = 0
                 progress.advance(task_id)
+                completed_since_cleanup += 1
+                if completed_since_cleanup >= cleanup_interval:
+                    docker_cleanup()
+                    completed_since_cleanup = 0
 
     _print_summary(
         stage="Commit images (build)",
