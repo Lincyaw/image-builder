@@ -9,7 +9,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 
-DEFAULT_REGISTRY = "namanjain12/"
+DEFAULT_REGISTRY = "arl/"
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 

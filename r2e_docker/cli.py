@@ -8,7 +8,7 @@ Usage:
     python -m r2e_docker.cli build_all_bases --reference_commits refs.json
 
 Environment variables:
-    R2E_DOCKER_REGISTRY  — default registry prefix (fallback: "namanjain12/")
+    R2E_DOCKER_REGISTRY  — default registry prefix (fallback: "arl/")
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def build_base(
     Args:
         repo: Repository name (e.g. 'sympy').
         reference_commit: Commit hash to use for initial dependency installation.
-        registry: Docker registry prefix. Defaults to R2E_DOCKER_REGISTRY env var or 'namanjain12/'.
+        registry: Docker registry prefix. Defaults to R2E_DOCKER_REGISTRY env var or 'arl/'.
         rebuild: Force rebuild even if image exists.
         timeout: Build timeout in seconds.
 

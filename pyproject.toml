@@ -6,8 +6,10 @@ dependencies = [
     "typer>=0.16.0",
     "rich>=13.9.0",
     "datasets>=4.5.0",
+    "docker>=7.0.0",
+    "requests>=2.25.0",
 ]
 requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
-include = ["r2e_docker*"]
+include = ["r2e_docker*", "swe_docker*"]

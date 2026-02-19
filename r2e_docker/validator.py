@@ -1,15 +1,22 @@
 """Post-build F2P/P2P validation for Docker images.
 
-Runs tests inside a built image and classifies results:
-- F2P (fail-to-pass): expected PASSED on new commit, actually fails on old commit (bug-revealing)
-- P2P (pass-to-pass): expected PASSED, actually passes (stable)
-- F2F (fail-to-fail): expected not PASSED, actually not passes (fine)
-- P2F (pass-to-fail): expected not PASSED, actually passes (bad — must be 0)
+Two-step validation:
+
+Step 1 — Pre-patch (old commit, current image state):
+  Runs tests and classifies results against expected_output_json:
+  - F2P (fail-to-pass): expected PASSED on new commit, actually fails on old commit
+  - P2P (pass-to-pass): expected PASSED, actually passes (stable)
+  - F2F (fail-to-fail): expected not PASSED, actually not passes (fine)
+  - P2F (pass-to-fail): expected not PASSED, actually passes (bad — must be 0)
+
+Step 2 — Post-patch (checkout new commit):
+  Checks out the new (fixed) commit, re-runs tests, verifies:
+  - All expected-PASSED tests actually PASS
+  - F2P tests now PASS (the fix works)
 
 An image passes validation when:
-  1. The test sets match (no missing/extra tests)
-  2. At least one F2P test exists
-  3. Zero P2F tests
+  Step 1: same test set, F2P >= 1, P2F == 0
+  Step 2: all expected-PASSED tests pass (F2P resolved, P2P still pass)
 """
 
 from __future__ import annotations
@@ -95,15 +102,20 @@ class ValidationResult:
     missing_tests: list[str] = field(default_factory=list)
     extra_tests: list[str] = field(default_factory=list)
     raw_output: str = ""
+    post_patch_output: str = ""
+    post_patch_failures: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         """One-line summary."""
         status = "PASS" if self.passed else "FAIL"
+        post = ""
+        if self.post_patch_failures:
+            post = f" post_fail={len(self.post_patch_failures)}"
         return (
             f"[{status}] F2P={len(self.f2p_tests)} P2P={len(self.p2p_tests)} "
             f"F2F={len(self.f2f_tests)} P2F={len(self.p2f_tests)} "
-            f"missing={len(self.missing_tests)} extra={len(self.extra_tests)} "
-            f"| {self.reason}"
+            f"missing={len(self.missing_tests)} extra={len(self.extra_tests)}"
+            f"{post} | {self.reason}"
         )
 
     def detailed_log(self) -> str:
@@ -123,8 +135,17 @@ class ValidationResult:
         _section("Missing tests (expected but not in output)", self.missing_tests)
         _section("Extra tests (in output but not expected)", self.extra_tests)
 
-        lines.append("--- Raw test output ---")
+        if self.post_patch_failures:
+            _section("Post-patch failures (should all PASS)", self.post_patch_failures)
+
+        lines.append("--- Raw test output (pre-patch) ---")
         lines.append(self.raw_output)
+
+        if self.post_patch_output:
+            lines.append("")
+            lines.append("--- Raw test output (post-patch) ---")
+            lines.append(self.post_patch_output)
+
         return "\n".join(lines)
 
 
@@ -193,17 +214,26 @@ def validate_image(
     image: str,
     expected_output_json: dict[str, str],
     timeout: int = 300,
+    new_commit: str | None = None,
 ) -> ValidationResult:
     """Run tests in a Docker image and validate against expected results.
 
+    Two-step validation when ``new_commit`` is provided:
+      Step 1: Run tests on old commit (current image state).
+      Step 2: Checkout new_commit, reinstall, run tests again.
+
     Args:
-        image: Docker image name (e.g. "namanjain12/sympy_final:abc123").
+        image: Docker image name (e.g. "arl/sympy_final:abc123").
         expected_output_json: {test_name: expected_status} from dataset.
-        timeout: Timeout in seconds for docker run.
+        timeout: Timeout in seconds for each docker run.
+        new_commit: The NEW (fixed) commit hash. If provided, enables step 2
+            validation (checkout new commit, verify F2P tests now pass).
+            The R2E dataset's commit_hash field is the new commit.
 
     Returns:
         ValidationResult with classification of all tests.
     """
+    # ---- Step 1: Pre-patch (old commit) ----
     try:
         res = subprocess.run(
             ["docker", "run", "--rm", image, "bash", "run_tests.sh"],
@@ -229,6 +259,97 @@ def validate_image(
 
     result = compare_results(actual, expected_output_json)
     result.raw_output = raw_output
+
+    if not result.passed:
+        return result
+
+    # ---- Step 2: Post-patch (new commit) ----
+    if new_commit is None:
+        # Step 1 only — keep existing behavior
+        return result
+
+    # Run tests on the new (fixed) commit inside a container
+    try:
+        # Start container (not --rm, so we can exec commands)
+        container_id = subprocess.run(
+            ["docker", "create", image, "tail", "-f", "/dev/null"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+
+        subprocess.run(
+            ["docker", "start", container_id],
+            capture_output=True,
+            timeout=30,
+        )
+
+        # Checkout the new (fixed) commit and reinstall
+        checkout_cmd = (
+            f"cd /testbed && "
+            f"git reset --hard && git checkout -f {new_commit} && "
+            f"bash install.sh --quick"
+        )
+        subprocess.run(
+            ["docker", "exec", container_id, "bash", "-c", checkout_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+        # Run tests on the new commit
+        post_res = subprocess.run(
+            ["docker", "exec", container_id, "bash", "run_tests.sh"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        post_output = post_res.stdout + post_res.stderr
+
+    except subprocess.TimeoutExpired:
+        result.passed = False
+        result.reason = f"post-patch docker exec timed out after {timeout}s"
+        result.post_patch_output = f"TIMEOUT after {timeout}s"
+        return result
+    except Exception as e:
+        result.passed = False
+        result.reason = f"post-patch execution error: {e}"
+        return result
+    finally:
+        # Cleanup container
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                capture_output=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
+
+    result.post_patch_output = post_output
+
+    post_actual = parse_test_output(post_output)
+    if post_actual is None:
+        result.passed = False
+        result.reason = "could not parse post-patch test output"
+        return result
+
+    # All expected-PASSED tests should now PASS on the new commit
+    post_failures = []
+    for name, exp_status in expected_output_json.items():
+        if exp_status == "PASSED":
+            actual_status = post_actual.get(name)
+            if actual_status != "PASSED":
+                post_failures.append(f"{name} (got {actual_status})")
+
+    if post_failures:
+        result.passed = False
+        result.post_patch_failures = post_failures
+        result.reason = (
+            f"step 2 (post-patch) failed: {len(post_failures)} expected-PASSED "
+            f"tests did not pass on new commit"
+        )
+
     return result
 
 

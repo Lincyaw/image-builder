@@ -65,7 +65,7 @@ DEFAULT_REFERENCE_COMMITS: dict[str, str] = {
 def _parse_docker_image(docker_image: str) -> tuple[str, str]:
     """Extract (repo_name, commit_hash) from docker_image string.
 
-    e.g. 'namanjain12/sympy_final:abc123' -> ('sympy', 'abc123')
+    e.g. 'arl/sympy_final:abc123' -> ('sympy', 'abc123')
     """
     name_tag = docker_image.rsplit("/", 1)[-1]
     name, tag = name_tag.rsplit(":", 1)
@@ -255,6 +255,7 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | N
         do_validate,
         expected_output_json,
         validation_timeout,
+        new_commit_hash,
     ) = args
 
     try:
@@ -279,7 +280,11 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | N
 
         # Post-build validation
         if do_validate and expected_output_json:
-            vr = validate_image(result, expected_output_json, timeout=validation_timeout)
+            vr = validate_image(
+                result, expected_output_json,
+                timeout=validation_timeout,
+                new_commit=new_commit_hash,
+            )
             if not vr.passed:
                 delete_image(result)
                 return (f"{repo_str}:{commit_hash}", None, None, None, vr.detailed_log())
@@ -338,7 +343,7 @@ def build_all_bases(
         push: Push base images to registry after building.
         max_push_concurrency: Max simultaneous docker push calls.
     """
-    reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "namanjain12/")
+    reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "arl/")
 
     if reference_commits:
         with open(reference_commits) as f:
@@ -400,6 +405,7 @@ def build_from_dataset(
     output_dir: str = "output",
     validate: bool = True,
     validation_timeout: int = 300,
+    max_push_concurrency: int = 4,
 ) -> None:
     """Build Docker images from a HuggingFace dataset (streaming, no full download).
 
@@ -415,12 +421,13 @@ def build_from_dataset(
         output_dir: Directory to save failure logs for debugging.
         validate: Run F2P/P2P validation after each build (default True).
         validation_timeout: Timeout in seconds for validation docker run.
+        max_push_concurrency: Max simultaneous docker push calls.
     """
     from datasets import load_dataset as _load
 
-    reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "namanjain12/")
+    reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "arl/")
 
-    log_dir = Path(output_dir) / "failed_logs"
+    log_dir = Path(output_dir) / "r2e_docker" / "failed_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     console.print(f"Failure logs will be saved to: [cyan]{log_dir}[/cyan]")
 
@@ -466,6 +473,11 @@ def build_from_dataset(
                 elif isinstance(raw_expected, dict):
                     expected_out = raw_expected
 
+            # Extract the NEW (fixed) commit hash for step 2 validation.
+            # In the R2E dataset, commit_hash from docker_image IS the new commit.
+            # The old (buggy) commit is commit_hash~1, checked out during build.
+            new_commit_for_validation = entry.get("commit_hash", commit_hash)
+
             all_tasks.append(
                 (
                     repo_str,
@@ -478,6 +490,7 @@ def build_from_dataset(
                     validate,
                     expected_out,
                     validation_timeout,
+                    new_commit_for_validation,
                 )
             )
 
