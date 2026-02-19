@@ -17,7 +17,7 @@ import json
 import os
 import shutil
 import tempfile
-from multiprocessing import Pool
+from multiprocessing import Pool, Semaphore
 from pathlib import Path
 
 import typer
@@ -36,6 +36,7 @@ from r2e_docker.builder import (
     build_base_image,
     build_commit_image,
     generate_commit_dockerfile,
+    init_push_semaphore,
 )
 from r2e_docker.validator import validate_image, delete_image
 
@@ -146,9 +147,7 @@ def _apply_repo_heuristics(
                 ".venv/bin/python -W ignore r2e_tests/unittest_custom_runner.py"
             )
         # Copy Tests/helper.py from repo if it exists (Pillow helper module)
-        extra_dockerfile_lines.append(
-            "# Copy Pillow test helper if available"
-        )
+        extra_dockerfile_lines.append("# Copy Pillow test helper if available")
         extra_dockerfile_lines.append(
             "RUN cp Tests/helper.py /testbed/r2e_tests/helper.py 2>/dev/null || true"
         )
@@ -167,7 +166,7 @@ def _apply_repo_heuristics(
         )
         extra_dockerfile_lines.append(
             "RUN for f in tornado/test/*.cfg tornado/test/*.crt tornado/test/*.key tornado/test/*.txt; do "
-            "cp \"$f\" /testbed/r2e_tests/ 2>/dev/null || true; "
+            'cp "$f" /testbed/r2e_tests/ 2>/dev/null || true; '
             "done; "
             "for d in tornado/test/csv_translations tornado/test/gettext_translations "
             "tornado/test/static tornado/test/templates; do "
@@ -179,9 +178,7 @@ def _apply_repo_heuristics(
         # Copy tests/conftest.py from repo inside the container if not already
         # in test files (the dataset usually includes it from extraction)
         if "conftest.py" not in test_file_names:
-            extra_dockerfile_lines.append(
-                "# Copy aiohttp test conftest from repo"
-            )
+            extra_dockerfile_lines.append("# Copy aiohttp test conftest from repo")
             extra_dockerfile_lines.append(
                 "RUN cp tests/conftest.py /testbed/r2e_tests/conftest.py 2>/dev/null || true"
             )
@@ -212,8 +209,8 @@ def _prepare_build_context(
     (tests_dir / "__init__.py").write_text("")
 
     # Apply repo-specific heuristics (may mutate test_file_codes/names, copy files)
-    test_cmd_override, extra_dockerfile_lines, pre_install_copies = _apply_repo_heuristics(
-        config, test_file_codes, test_file_names, tests_dir
+    test_cmd_override, extra_dockerfile_lines, pre_install_copies = (
+        _apply_repo_heuristics(config, test_file_codes, test_file_names, tests_dir)
     )
 
     # Write test files (after heuristics may have modified them)
@@ -293,15 +290,16 @@ def _build_one_commit(args: tuple) -> tuple[str, str | None, str | None, str | N
 
 
 def _build_one_base(
-    args: tuple[str, str, str, bool],
+    args: tuple[str, str, str, bool, bool],
 ) -> tuple[str, str | None, str | None]:
     """Build a single base image. Returns (repo, image | None, error)."""
-    repo_str, commit_hash, registry, rebuild = args
+    repo_str, commit_hash, registry, rebuild, do_push = args
     try:
         config = DockerBuildConfig(
             repo_name=RepoName(repo_str),
             registry=registry,
             rebuild_base=rebuild,
+            push=do_push,
         )
     except ValueError:
         return (repo_str, None, f"Unknown repo: {repo_str}")
@@ -325,7 +323,9 @@ def build_all_bases(
     repos: str | None = None,
     registry: str | None = None,
     rebuild: bool = False,
+    push: bool = False,
     max_workers: int = 4,
+    max_push_concurrency: int = 4,
 ) -> None:
     """Build base images for all (or selected) repos. No dataset needed.
 
@@ -335,6 +335,8 @@ def build_all_bases(
         repos: Comma-separated repo names to build. If omitted, builds all.
         registry: Docker registry prefix.
         rebuild: Force rebuild even if image exists.
+        push: Push base images to registry after building.
+        max_push_concurrency: Max simultaneous docker push calls.
     """
     reg = registry or os.environ.get("R2E_DOCKER_REGISTRY", "namanjain12/")
 
@@ -348,16 +350,16 @@ def build_all_bases(
         selected = {r.strip() for r in repos.split(",")}
         commits = {k: v for k, v in commits.items() if k in selected}
 
-    console.print(f"Building base images for {len(commits)} repos")
     success = 0
     failed: list[tuple[str, str]] = []
     tasks = [
-        (repo_str, commit_hash, reg, rebuild)
+        (repo_str, commit_hash, reg, rebuild, push)
         for repo_str, commit_hash in commits.items()
     ]
     if tasks:
         workers = max(1, min(max_workers, len(tasks)))
-        with Pool(workers) as pool:
+        sem = Semaphore(max_push_concurrency)
+        with Pool(workers, initializer=init_push_semaphore, initargs=(sem,)) as pool:
             with Progress(
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
@@ -488,12 +490,15 @@ def build_from_dataset(
     base_success = 0
     base_failed: list[tuple[str, str]] = []
     base_tasks = [
-        (repo_str, commit_hash, reg, rebuild)
+        (repo_str, commit_hash, reg, rebuild, push)
         for repo_str, commit_hash in repo_first_commit.items()
     ]
     if base_tasks:
         base_workers = max(1, min(max_workers, len(base_tasks)))
-        with Pool(base_workers) as pool:
+        sem = Semaphore(max_push_concurrency)
+        with Pool(
+            base_workers, initializer=init_push_semaphore, initargs=(sem,)
+        ) as pool:
             with Progress(
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
