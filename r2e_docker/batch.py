@@ -566,54 +566,74 @@ def build_from_dataset(
         _print_summary(stage="Commit images", success=0, failed_items=[], total=0)
         return
 
-    # Prune Docker build cache before starting commit builds to maximize disk space
-    console.print("[dim]Running Docker cleanup before commit builds...[/dim]")
-    docker_cleanup()
-
     success = 0
     build_failed: list[str] = []
     validation_failed: list[str] = []
-    completed_since_cleanup = 0
-    cleanup_interval = 50  # prune every N completed builds
-    with Pool(max_workers) as pool:
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task_id = progress.add_task("Building commit images", total=len(all_tasks))
-            for key, result, build_error, log, val_error in pool.imap_unordered(
-                _build_one_commit, all_tasks
-            ):
-                if result:
-                    success += 1
-                elif val_error:
-                    validation_failed.append(f"{key}: validation failed")
-                    # Save validation failure log
-                    safe_key = key.replace("/", "_").replace(":", "_")
-                    log_file = log_dir / f"validation_{safe_key}.log"
-                    log_file.write_text(val_error)
-                else:
-                    msg = build_error or "unknown error"
-                    build_failed.append(f"{key}: {msg}")
-                    # Save build failure log
-                    safe_key = key.replace("/", "_").replace(":", "_")
-                    log_file = log_dir / f"commit_{safe_key}.log"
-                    log_content = f"Error: {msg}\n"
-                    if log:
-                        log_content += f"\n--- Docker Build Output ---\n{log}"
-                    log_file.write_text(log_content)
-                    # Trigger immediate cleanup on disk space errors
-                    if log and "no space left on device" in log:
-                        docker_cleanup()
-                        completed_since_cleanup = 0
-                progress.advance(task_id)
-                completed_since_cleanup += 1
-                if completed_since_cleanup >= cleanup_interval:
-                    docker_cleanup()
-                    completed_since_cleanup = 0
+    remaining_tasks = list(all_tasks)
+    max_disk_retries = 3  # retry rounds for disk-space failures
+
+    for attempt in range(1 + max_disk_retries):
+        if not remaining_tasks:
+            break
+
+        # Build a lookup so we can recover original args from the returned key
+        task_by_key: dict[str, tuple] = {}
+        for t in remaining_tasks:
+            repo_str, commit_hash = t[0], t[1]
+            task_by_key[f"{repo_str}:{commit_hash}"] = t
+
+        disk_space_retry: list[tuple] = []
+
+        with Pool(max_workers) as pool:
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                label = (
+                    "Building commit images"
+                    if attempt == 0
+                    else f"Retrying disk-space failures (round {attempt + 1})"
+                )
+                task_id = progress.add_task(label, total=len(remaining_tasks))
+                for key, result, build_error, log, val_error in pool.imap_unordered(
+                    _build_one_commit, remaining_tasks
+                ):
+                    if result:
+                        success += 1
+                    elif val_error:
+                        validation_failed.append(f"{key}: validation failed")
+                        safe_key = key.replace("/", "_").replace(":", "_")
+                        log_file = log_dir / f"validation_{safe_key}.log"
+                        log_file.write_text(val_error)
+                    else:
+                        msg = build_error or "unknown error"
+                        is_disk_error = log and "no space left on device" in log
+                        if is_disk_error and attempt < max_disk_retries:
+                            disk_space_retry.append(task_by_key[key])
+                        else:
+                            build_failed.append(f"{key}: {msg}")
+                            safe_key = key.replace("/", "_").replace(":", "_")
+                            log_file = log_dir / f"commit_{safe_key}.log"
+                            log_content = f"Error: {msg}\n"
+                            if log:
+                                log_content += (
+                                    f"\n--- Docker Build Output ---\n{log}"
+                                )
+                            log_file.write_text(log_content)
+                    progress.advance(task_id)
+
+        if not disk_space_retry:
+            break
+
+        console.print(
+            f"[yellow]{len(disk_space_retry)} tasks failed due to disk space. "
+            f"Running Docker cleanup before retry...[/yellow]"
+        )
+        docker_cleanup()
+        remaining_tasks = disk_space_retry
 
     _print_summary(
         stage="Commit images (build)",

@@ -20,25 +20,46 @@ def init_push_semaphore(sem: Any) -> None:
 
 
 def docker_cleanup() -> None:
-    """Prune dangling images, stopped containers, and build cache to free disk space.
+    """Free disk space by removing built commit images, containers, and build cache.
 
-    Safe to call concurrently from worker processes — Docker handles locking internally.
+    The biggest space consumers are tagged *_final images from previous builds.
+    ``docker image prune`` only removes dangling (untagged) images, so we
+    explicitly remove *_final images first.
+
+    Each step is wrapped in try/except so a slow or failing operation never
+    blocks the build pipeline.
     """
-    subprocess.run(
-        ["docker", "builder", "prune", "-f", "--filter", "until=1h"],
-        capture_output=True,
-        timeout=120,
-    )
-    subprocess.run(
-        ["docker", "image", "prune", "-f"],
-        capture_output=True,
-        timeout=60,
-    )
-    subprocess.run(
-        ["docker", "container", "prune", "-f"],
-        capture_output=True,
-        timeout=60,
-    )
+    # 1. Remove successfully built commit images (*_final:*) — these are the
+    #    largest consumers (hundreds of GB).  They can be rebuilt or pulled.
+    try:
+        res = subprocess.run(
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}",
+             "--filter", "reference=*_final:*"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            images = res.stdout.strip().splitlines()
+            # Delete in batches to avoid argument list too long
+            batch_size = 50
+            for i in range(0, len(images), batch_size):
+                batch = images[i:i + batch_size]
+                subprocess.run(
+                    ["docker", "rmi", "-f"] + batch,
+                    capture_output=True, timeout=300,
+                )
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+
+    # 2. Prune stopped containers, dangling images, build cache
+    for cmd, timeout in [
+        (["docker", "container", "prune", "-f"], 120),
+        (["docker", "image", "prune", "-f"], 300),
+        (["docker", "builder", "prune", "-f", "--filter", "until=1h"], 600),
+    ]:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def build_base_image(config: DockerBuildConfig, reference_commit: str) -> str:
@@ -141,6 +162,10 @@ def generate_commit_dockerfile(
     lines = [
         f"FROM {base_image}",
         "",
+        "# Chinese mirrors for uv (PyPI packages and Python interpreter downloads)",
+        "ENV UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple",
+        "ENV UV_PYTHON_INSTALL_MIRROR=https://ghp.ci/https://github.com/astral-sh/python-build-standalone/releases/download",
+        "",
         "ARG OLD_COMMIT",
         "WORKDIR /testbed",
         "",
@@ -163,14 +188,14 @@ def generate_commit_dockerfile(
         for filename in pre_install_copies:
             lines.append(f"COPY {filename} /testbed/{filename}")
 
-    # Re-run install in quick mode (reuses existing .venv, only reinstalls editable)
+    # Re-run full install (matches original repo behavior — always clean install per commit)
     lines.extend(
         [
             "",
             "COPY install.sh /testbed/install.sh",
             "RUN --mount=type=cache,target=/root/.cache/uv \\",
             "    --mount=type=cache,target=/root/.cache/pip \\",
-            "    bash install.sh --quick",
+            "    bash install.sh",
         ]
     )
 

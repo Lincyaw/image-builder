@@ -2,16 +2,19 @@
 
 set -e  # Exit on any error
 
-# Quick mode: reuse existing venv, rebuild extensions for the checked-out commit
+# Quick mode: try to reuse existing venv; fall through to full install on failure
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    # Clean old compiled files
+    # Pin setuptools<60: numpy.distutils breaks with setuptools>=60
+    uv pip install "setuptools<60" --force-reinstall 2>/dev/null || true
+    uv pip install trubar 2>/dev/null || true
     find . -name '*.pyc' -delete 2>/dev/null || true
     find . -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
-    # Rebuild C extensions and reinstall in develop mode
-    .venv/bin/python setup.py build_ext --inplace
-    .venv/bin/python setup.py develop || uv pip install -e .
-    exit 0
+    if .venv/bin/python setup.py build_ext --inplace 2>/dev/null \
+       && .venv/bin/python setup.py develop 2>/dev/null; then
+        exit 0
+    fi
+    echo "[INFO] Quick install failed, falling back to full install..."
 fi
 
 check_orange() {
@@ -53,7 +56,7 @@ try_install_python38() {
     uv pip install --upgrade "setuptools<60" "numpy<1.25" wheel "cython<0.30" pytest "PyQt5>=5.12,!=5.15.1" "PyQtWebEngine>=5.12"
     uv pip install -r requirements-core.txt
     uv pip install -r requirements-gui.txt
-    uv pip install -r requirements-sql.txt --ignore-errors || uv pip install -r requirements-sql.txt --ignore-errors 2>/dev/null || true
+    uv pip install -r requirements-sql.txt 2>/dev/null || uv pip install -r requirements-sql.txt 2>/dev/null || true
     if [ -f requirements-opt.txt ]; then
         uv pip install -r requirements-opt.txt || true
     fi
@@ -75,7 +78,7 @@ try_install_python310() {
     if [ -f requirements-dev.txt ]; then
         uv pip install -r requirements-dev.txt || true
     fi
-    uv pip install -r requirements-sql.txt --ignore-errors || uv pip install -r requirements-sql.txt --ignore-errors 2>/dev/null || true
+    uv pip install -r requirements-sql.txt 2>/dev/null || uv pip install -r requirements-sql.txt 2>/dev/null || true
     .venv/bin/python setup.py build_ext --inplace
     .venv/bin/python setup.py develop
     # Re-pin setuptools after develop (pip may have upgraded it)

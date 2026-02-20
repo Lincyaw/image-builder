@@ -2,14 +2,15 @@
 
 set -e  # Exit on any error
 
-# Quick mode: reuse existing venv, rebuild C extensions for the checked-out commit
+# Quick mode: try to reuse existing venv; fall through to full install on failure
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    # Clean old compiled files
     find . -name '*.pyc' -delete 2>/dev/null || true
     find . -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
-    uv pip install -e . --no-build-isolation
-    exit 0
+    if uv pip install -e . --no-build-isolation 2>/dev/null; then
+        exit 0
+    fi
+    echo "[INFO] Quick install failed, falling back to full install..."
 fi
 
 check_pillow() {

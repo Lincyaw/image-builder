@@ -54,9 +54,13 @@ REPO_TEST_COMMANDS: dict[RepoName, str] = {
 }
 
 # Per-repo commit build timeout overrides (seconds).
-# Repos with heavy C extension compilation need longer than the default 600s.
+# Repos with multi-attempt install scripts (trying 3-4 Python versions) need
+# longer than the default 1200s. Original repo uses 1200s with single-stage builds.
 REPO_COMMIT_BUILD_TIMEOUTS: dict[RepoName, int] = {
     RepoName.numpy: 1800,
+    RepoName.orange3: 1800,
+    RepoName.pandas: 2400,
+    RepoName.bokeh: 1800,
 }
 
 
@@ -70,7 +74,7 @@ class DockerBuildConfig(BaseModel):
     push: bool = False
     memory_limit: str = "1g"
     base_build_timeout: int = 2400
-    commit_build_timeout: int = 600
+    commit_build_timeout: int = 1200
 
     model_config = {"arbitrary_types_allowed": True}
 

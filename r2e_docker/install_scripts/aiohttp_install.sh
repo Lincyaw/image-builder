@@ -1,12 +1,14 @@
-# Quick mode: reuse existing venv, just reinstall editable package
+# Quick mode: try to reuse existing venv; fall through to full install on failure
 if [ -d ".venv" ] && [ "$1" = "--quick" ]; then
     source .venv/bin/activate
-    uv pip install -e .
-    # Re-run asyncio migration if the script exists
-    if [ -f "process_aiohttp_updateasyncio.py" ]; then
-        .venv/bin/python process_aiohttp_updateasyncio.py
+    if uv pip install -e . 2>/dev/null; then
+        # Re-run asyncio migration if the script exists
+        if [ -f "process_aiohttp_updateasyncio.py" ]; then
+            .venv/bin/python process_aiohttp_updateasyncio.py 2>/dev/null || true
+        fi
+        exit 0
     fi
-    exit 0
+    echo "[INFO] Quick install failed, falling back to full install..."
 fi
 
 uv venv --python 3.9
